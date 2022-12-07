@@ -1,7 +1,9 @@
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Result};
 use futures::{Future, StreamExt};
-use redis::AsyncCommands;
 use redis::{aio::ConnectionManager, Cmd, FromRedisValue, ToRedisArgs};
+use redis::{AsyncCommands, RedisResult};
 
 const EXPIRE_SECONDS: usize = 60 * 60 * 4;
 
@@ -10,6 +12,7 @@ pub fn check_string(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Key {
     token: String,
     key: String,
@@ -42,18 +45,18 @@ impl Key {
     }
 
     pub fn from_redis_key(redis_key: &str) -> Result<Key> {
-        let v: Vec<&str> = redis_key.split(redis_key).collect();
+        let v: Vec<&str> = redis_key.split(":").collect();
 
         if !v.iter().all(|s| check_string(*s)) {
             return Err(anyhow!("Bad key"));
         }
 
-        match (v[0], v[1], &v[2..]) {
+        match (v[0], v[1], &v[2..v.len() - 1]) {
             ("pcafe", token, key) => Ok(Key {
                 token: token.to_owned(),
                 key: key.join(":"),
             }),
-            _ => Err(anyhow!("Bad structure")),
+            _ => Err(anyhow!("Bad structure: {:?}", v)),
         }
     }
 }
@@ -65,6 +68,7 @@ pub struct Update {
     max: Option<Option<i64>>,
 }
 
+#[derive(Debug)]
 pub struct Value {
     state: Option<String>,
     current: Option<i64>,
@@ -119,7 +123,7 @@ impl<C: redis::aio::ConnectionLike + AsyncCommands> Store<C> {
         Store { redis }
     }
 
-    pub async fn exec(&mut self, update: &Update) -> Result<()> {
+    pub async fn update(&mut self, update: &Update) -> Result<()> {
         for c in update.as_cmds() {
             c.query_async(&mut self.redis).await?;
         }
@@ -142,7 +146,7 @@ impl<C: redis::aio::ConnectionLike + AsyncCommands> Store<C> {
         })
     }
 
-    pub async fn get_all_keys(&mut self, token: &str, keyprefix: &str) -> Result<Vec<Key>> {
+    pub async fn get_all_keys(&mut self, token: &str, keyprefix: &str) -> Result<HashSet<Key>> {
         let kpref = Key::try_from((token, keyprefix))?;
 
         Ok(self
@@ -150,7 +154,43 @@ impl<C: redis::aio::ConnectionLike + AsyncCommands> Store<C> {
             .scan_match(kpref.redis_key_pattern())
             .await?
             .filter_map(|v: String| async move { Key::from_redis_key(&v).ok() })
-            .collect::<Vec<Key>>()
+            .collect::<HashSet<Key>>()
             .await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use redis::aio::ConnectionManager;
+
+    use crate::store::{Store, Update};
+
+    #[tokio::test]
+    async fn it_works() -> Result<()> {
+        let client = redis::Client::open("redis://127.0.0.1/")?;
+        let conm = ConnectionManager::new(client).await?;
+
+        let mut store = Store::new(conm);
+
+        store
+            .update(&Update::new(
+                ("randomtoken", "some:key").try_into()?,
+                None,
+                Some(Some(0)),
+                Some(Some(10)),
+            ))
+            .await?;
+
+        let keys = store.get_all_keys("randomtoken", "some:").await?;
+
+        println!("{:?}", &keys);
+
+        for key in keys {
+            let st = store.get_state(&key).await?;
+            println!("{:?} .. {:?}", key, st);
+        }
+
+        Ok(())
     }
 }
