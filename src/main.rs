@@ -10,18 +10,19 @@ mod store;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = redis::Client::open(
-        std::env::var("REDIS_URL")
-            .ok()
-            .and_then(|s| if s == "" { None } else { Some(s) })
-            .as_deref()
-            .unwrap_or("redis://127.0.0.1/"),
-    )?;
+    let redis_url: String = std::env::var("REDIS_URL")
+        .ok()
+        .and_then(|s| if s == "" { None } else { Some(s) })
+        .unwrap_or("redis://127.0.0.1/".to_owned());
+
+    println!("Will connect to {}", redis_url);
+
+    let client = redis::Client::open(redis_url)?;
     let conm = ConnectionManager::new(client)
         .await
-        .expect("Couldn't connect");
+        .expect("Couldn't connect to redis");
 
-    println!("Connected");
+    println!("Connected to redis");
 
     let store = Store::new(conm);
 
@@ -96,15 +97,14 @@ async fn main() -> Result<()> {
         .map(|res: anyhow::Result<String>| res.unwrap_or_else(|e| format!("Error: {:?}", e)))
         .map(warp::reply::html);
 
-    warp::serve(routes)
-        .run((
-            [127, 0, 0, 1],
-            std::env::var("PORT")
-                .ok()
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(3030),
-        ))
-        .await;
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(3030);
+
+    println!("Will listen on {}", port);
+
+    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
 
     Ok(())
 }
