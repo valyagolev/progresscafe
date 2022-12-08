@@ -45,10 +45,12 @@ async fn main() -> Result<()> {
                         let state = store.get_state(&key).await?;
 
                         Ok(format!(
-                            "<b>{}</b> <progress value='{}' max='{}'>what </progress> <i>{}</i>",
+                            "<b>{}</b> <progress value='{}' max='{}'>what </progress> <b>{}/{}</b> <i>{}</i>",
                             key.key,
                             state.current.unwrap_or(0),
                             state.max.unwrap_or(100),
+                            state.current.map(|v| v.to_string()).as_deref().unwrap_or("?"),
+                            state.max.map(|v| v.to_string()).as_deref().unwrap_or("?"),
                             state.state.as_deref().unwrap_or("?")
                         ))
                     })
