@@ -7,26 +7,42 @@ use redis::{AsyncCommands, RedisResult};
 
 const EXPIRE_SECONDS: usize = 60 * 60 * 4;
 
-pub fn check_string(s: &str) -> bool {
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+pub fn check_string(s: &str) -> Result<&str> {
+    let r = s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+
+    if r {
+        Ok(s)
+    } else {
+        Err(anyhow!("must be {}", STRING_REQ))
+    }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+pub fn parse_i64_or_null(s: &str) -> Result<Option<i64>> {
+    if s.to_ascii_lowercase() == "null" {
+        Ok(None)
+    } else {
+        Ok(Some(s.parse()?))
+    }
+}
+
+const STRING_REQ: &str = "[a-z0-9_.-]";
+
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key {
     token: String,
-    key: String,
+    pub key: String,
 }
 
-impl TryFrom<(&str, &str)> for Key {
-    fn try_from((token, key): (&str, &str)) -> Result<Self> {
-        if !check_string(token) {
-            return Err(anyhow!("token must be [a-z0-9_.-]"));
-        }
+impl<S1: Into<String>, S2: Into<String>> TryFrom<(S1, S2)> for Key {
+    fn try_from((token, key): (S1, S2)) -> Result<Self> {
+        let token = token.into();
+        check_string(&token)?;
 
         Ok(Key {
-            token: token.to_owned(),
-            key: key.to_owned(),
+            token,
+            key: key.into(),
         })
     }
 
@@ -45,11 +61,9 @@ impl Key {
     }
 
     pub fn from_redis_key(redis_key: &str) -> Result<Key> {
-        let v: Vec<&str> = redis_key.split(":").collect();
+        let vr: Result<Vec<&str>> = redis_key.split(":").map(check_string).collect();
 
-        if !v.iter().all(|s| check_string(*s)) {
-            return Err(anyhow!("Bad key"));
-        }
+        let v = vr?;
 
         match (v[0], v[1], &v[2..v.len() - 1]) {
             ("pcafe", token, key) => Ok(Key {
@@ -61,24 +75,25 @@ impl Key {
     }
 }
 
+#[derive(Debug)]
 pub struct Update {
     key: Key,
-    state: Option<Option<String>>,
+    state: Option<String>,
     current: Option<Option<i64>>,
     max: Option<Option<i64>>,
 }
 
 #[derive(Debug)]
 pub struct Value {
-    state: Option<String>,
-    current: Option<i64>,
-    max: Option<i64>,
+    pub state: Option<String>,
+    pub current: Option<i64>,
+    pub max: Option<i64>,
 }
 
 impl Update {
     pub fn new(
         key: Key,
-        state: Option<Option<String>>,
+        state: Option<String>,
         current: Option<Option<i64>>,
         max: Option<Option<i64>>,
     ) -> Update {
@@ -105,40 +120,65 @@ impl Update {
 
     pub fn as_cmds(&self) -> impl Iterator<Item = Cmd> {
         [
-            self.as_cmd("state", &self.state),
+            self.as_cmd("state", &Some(self.state.as_ref())),
             self.as_cmd("current", &self.current),
             self.as_cmd("max", &self.max),
         ]
         .into_iter()
         .flatten()
     }
+
+    pub fn from_query(token: &str, (key, val): (String, String)) -> Result<Self> {
+        let (state, rest) = match val.split_once("!") {
+            Some((state, rest)) => (Some(check_string(state)?.to_owned()), rest),
+            None => (None, val.as_ref()),
+        };
+        let (current, max) = match rest.split_once("/") {
+            Some((c, m)) => (c, Some(parse_i64_or_null(m)?)),
+            None => (rest, None),
+        };
+
+        let current = if current == "" {
+            None
+        } else {
+            Some(parse_i64_or_null(current)?)
+        };
+
+        Ok(Update {
+            key: (token.to_owned(), key).try_into()?,
+            state,
+            current,
+            max,
+        })
+    }
 }
 
-pub struct Store<C: redis::aio::ConnectionLike + AsyncCommands> {
+#[derive(Clone)]
+pub struct Store<C: redis::aio::ConnectionLike + AsyncCommands + Clone> {
     redis: C,
 }
 
-impl<C: redis::aio::ConnectionLike + AsyncCommands> Store<C> {
+impl<C: redis::aio::ConnectionLike + AsyncCommands + Clone> Store<C> {
     pub fn new(redis: C) -> Store<C> {
         Store { redis }
     }
 
-    pub async fn update(&mut self, update: &Update) -> Result<()> {
+    pub async fn update(&self, update: &Update) -> Result<()> {
         for c in update.as_cmds() {
-            c.query_async(&mut self.redis).await?;
+            c.query_async(&mut self.redis.clone()).await?;
         }
 
         Ok(())
     }
 
-    async fn get_param<T: FromRedisValue>(&mut self, key: &Key, param: &str) -> Result<Option<T>> {
+    async fn get_param<T: FromRedisValue>(&self, key: &Key, param: &str) -> Result<Option<T>> {
         Cmd::get(key.redis_key(param))
-            .query_async(&mut self.redis)
+            .query_async(&mut self.redis.clone())
             .await
             .map_err(|e| anyhow::Error::new(e))
     }
 
-    pub async fn get_state(&mut self, key: &Key) -> Result<Value> {
+    pub async fn get_state(&self, key: &Key) -> Result<Value> {
         Ok(Value {
             state: self.get_param(key, "state").await?,
             current: self.get_param(key, "current").await?,
@@ -146,11 +186,12 @@ impl<C: redis::aio::ConnectionLike + AsyncCommands> Store<C> {
         })
     }
 
-    pub async fn get_all_keys(&mut self, token: &str, keyprefix: &str) -> Result<HashSet<Key>> {
-        let kpref = Key::try_from((token, keyprefix))?;
+    pub async fn get_all_keys(&self, token: &str, keyprefix: &str) -> Result<HashSet<Key>> {
+        let kpref = Key::try_from((token.to_owned(), keyprefix.to_owned()))?;
 
         Ok(self
             .redis
+            .clone()
             .scan_match(kpref.redis_key_pattern())
             .await?
             .filter_map(|v: String| async move { Key::from_redis_key(&v).ok() })
@@ -171,7 +212,7 @@ mod tests {
         let client = redis::Client::open("redis://127.0.0.1/")?;
         let conm = ConnectionManager::new(client).await?;
 
-        let mut store = Store::new(conm);
+        let store = Store::new(conm);
 
         store
             .update(&Update::new(
@@ -184,7 +225,7 @@ mod tests {
 
         let keys = store.get_all_keys("randomtoken", "some:").await?;
 
-        println!("{:?}", &keys);
+        println!("get_all_keys {:?}", &keys);
 
         for key in keys {
             let st = store.get_state(&key).await?;
