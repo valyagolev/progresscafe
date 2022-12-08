@@ -87,7 +87,9 @@ async fn main() -> Result<()> {
 
                 send the reports as: https://progresscafe.fly.dev/send/$YOURTOKEN?test:key=10/100<br><br>
 
-                view the progress at: https://progresscafe.fly.dev/see/$YOURTOKEN
+                view the progress at: https://progresscafe.fly.dev/see/$YOURTOKEN<br><br>
+
+                https://github.com/valyagolev/progresscafe
          ".to_owned())
     });
 
