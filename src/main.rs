@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
         })
     };
 
-    let hello = warp::path!("send" / String)
+    let send = warp::path!("send" / String)
         .and(warp::query::<Vec<(String, String)>>())
         .then(move |token: String, query: Vec<(String, String)>| {
             let store = store.clone();
@@ -79,7 +79,18 @@ async fn main() -> Result<()> {
             }
         });
 
-    let routes = hello
+    let index = warp::path::end().map(|| {
+        Ok("Pick a <i>token</i>, then:<br><br>
+
+                send the reports as: https://progresscafe.fly.dev/send/$YOURTOKEN?test:key=10/100<br><br>
+
+                view the progress at: https://progresscafe.fly.dev/see/$YOURTOKEN
+         ".to_owned())
+    });
+
+    let routes = index
+        .or(send)
+        .unify()
         .or(see)
         .unify()
         .map(|res: anyhow::Result<String>| res.unwrap_or_else(|e| format!("Error: {:?}", e)))
