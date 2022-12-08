@@ -10,7 +10,13 @@ mod store;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let client = redis::Client::open(
+        std::env::var("REDIS_URL")
+            .ok()
+            .and_then(|s| if s == "" { None } else { Some(s) })
+            .as_deref()
+            .unwrap_or("redis://127.0.0.1/"),
+    )?;
     let conm = ConnectionManager::new(client)
         .await
         .expect("Couldn't connect");
@@ -79,7 +85,15 @@ async fn main() -> Result<()> {
         .map(|res: anyhow::Result<String>| res.unwrap_or_else(|e| format!("Error: {:?}", e)))
         .map(warp::reply::html);
 
-    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+    warp::serve(routes)
+        .run((
+            [127, 0, 0, 1],
+            std::env::var("PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(3030),
+        ))
+        .await;
 
     Ok(())
 }
